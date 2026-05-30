@@ -1,0 +1,36 @@
+# For local dev / EC2 deployment
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: perfume_db
+    ports:
+      - "5432:5432"
+
+  # S3 Raw Store Alternative (Zero-Cost)
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  # Normalization Queue Broker
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  # Local AI Model Server
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama_data:/root/.ollama
