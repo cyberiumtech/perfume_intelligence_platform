@@ -4,8 +4,8 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
-api_key = os.getenv("BEDROCK_API_KEY", "")
-
+api_key = os.getenv("BEDROCK_API_KEY")
+print(api_key)
 headers = {
     "Authorization": f"Bearer {api_key}",
     "Content-Type": "application/json"

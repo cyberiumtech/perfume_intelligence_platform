@@ -35,6 +35,7 @@ class Product(Base):
     listings = relationship("ProductListing", back_populates="product", cascade="all, delete-orphan")
 
     __table_args__ = (
+        UniqueConstraint("brand", "product_name", "variant", "ml", name="uq_product_identity", postgresql_nulls_not_distinct=True),
         Index("ix_products_search_vector", "search_vector", postgresql_using="gin"),
         Index("ix_products_brand_name", "brand", "product_name"),
     )

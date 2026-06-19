@@ -14,6 +14,7 @@ import json
 import os
 import re
 from typing import Optional, Dict, Any
+from bs4 import BeautifulSoup
 
 from dotenv import load_dotenv
 from .schemas import AIProductExtraction
@@ -31,15 +32,13 @@ bedrock_config = Config(
 bedrock_client = boto3.client(
     service_name="bedrock-runtime",
     region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     config=bedrock_config
 )
 
 # ── Regex Pre-extractors ────────────────────────────────────────────────────
 
 _ML_PATTERN = re.compile(
-    r"\b(\d{2,4})\s*(?:ml|ML|Ml|mL)\b",
+    r"\b(\d{1,5})\s*(?:ml|ML|Ml|mL)\b",
     re.IGNORECASE,
 )
 
@@ -88,7 +87,12 @@ def _extract_gender(title: str, tags: list) -> Optional[str]:
 
 
 def _strip_html(html: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", html or "")
+    if not html:
+        return ""
+    try:
+        text = BeautifulSoup(html, "html.parser").get_text(separator=" ")
+    except Exception:
+        text = str(html)
     return re.sub(r"\s+", " ", text).strip()[:300]
 
 
@@ -280,7 +284,6 @@ Output ONLY a single valid JSON object. No markdown, no explanation, no extra te
             })
         except Exception as e:
             print(f"[AI Pipeline] Error (attempt {attempt + 1}): {e}")
-            break
+            raise e
 
-    print(f"[AI Pipeline] Falling back to defaults for: {raw_title}")
-    return default_result
+    raise ValueError(f"AI Pipeline failed to return valid JSON after 2 attempts for: {raw_title}")

@@ -102,7 +102,8 @@ def list_products(
     """Query normalized canonical products with optional filters."""
     q = db.query(Product)
     if brand:
-        q = q.filter(Product.brand.ilike(f"%{brand}%"))
+        escaped_brand = brand.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        q = q.filter(Product.brand.ilike(f"%{escaped_brand}%", escape="\\"))
     if fragrance_type:
         q = q.filter(Product.fragrance_type == fragrance_type.upper())
     if gender:

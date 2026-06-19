@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -127,12 +128,18 @@ def _dump_to_s3(raw_data: list, source_id: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")
     key = f"raw/{source_id}/{timestamp}.json"
     try:
-        s3_client.put_object(
-            Bucket=BUCKET_NAME,
-            Key=key,
-            Body=json.dumps(raw_data, ensure_ascii=False).encode("utf-8"),
-            ContentType="application/json",
-        )
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as f:
+            json.dump(raw_data, f, ensure_ascii=False)
+            tmp_name = f.name
+            
+        with open(tmp_name, 'rb') as f:
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key=key,
+                Body=f,
+                ContentType="application/json",
+            )
+        os.unlink(tmp_name)
         return f"s3://{BUCKET_NAME}/{key}"
     except Exception as e:
         log.warning(f"S3 backup failed (non-fatal): {e}")
@@ -156,10 +163,10 @@ def process_listings_batch_task(self, batch: list, source_id: str):
             price = item.get("price", 0.0) or 0.0
             barcode = item.get("barcode", "") or ""
             sku = item.get("sku", "") or ""
-            stock = item.get("stock")
+            listing_url = item.get("url", "") or ""
 
-            # Prefer SKU as external ID; fall back to title hash
-            source_external_id = sku if sku else _title_id(raw_title)
+            # Prefer SKU as external ID; fall back to title + url hash
+            source_external_id = sku if sku else _title_id(raw_title, listing_url)
 
             state_string = f"{raw_title}-{price}-{barcode}-{stock}".encode("utf-8")
             current_hash = hashlib.sha256(state_string).hexdigest()
@@ -186,9 +193,9 @@ def process_listings_batch_task(self, batch: list, source_id: str):
         db.close()
 
 
-def _title_id(title: str) -> str:
-    """Generate a stable short ID from title for use as source_external_id."""
-    return hashlib.sha256(title.encode("utf-8")).hexdigest()[:32]
+def _title_id(title: str, url: str = "") -> str:
+    """Generate a stable short ID from title and url for use as source_external_id."""
+    return hashlib.sha256(f"{title}-{url}".encode("utf-8")).hexdigest()[:32]
 
 
 # ── Task 3: Normalize + Persist ───────────────────────────────────────────────
@@ -204,7 +211,8 @@ def normalize_and_persist_task(self, raw_listing: dict, source_id: str):
     db = SessionLocal()
     try:
         raw_title = raw_listing.get("raw_title", "") or ""
-        source_external_id = raw_listing.get("_source_external_id") or _title_id(raw_title)
+        listing_url = raw_listing.get("url", "") or ""
+        source_external_id = raw_listing.get("_source_external_id") or _title_id(raw_title, listing_url)
         current_hash = raw_listing.get("_current_hash", "")
 
         # ── Step 1: AI Normalization ─────────────────────────────────────
@@ -241,6 +249,14 @@ def normalize_and_persist_task(self, raw_listing: dict, source_id: str):
             )
             if ml:
                 q = q.filter(Product.ml == ml)
+            else:
+                q = q.filter(Product.ml.is_(None))
+                
+            if variant:
+                q = q.filter(Product.variant == variant)
+            else:
+                q = q.filter(Product.variant.is_(None))
+                
             canonical_product = q.first()
 
         if not canonical_product:
@@ -271,7 +287,7 @@ def normalize_and_persist_task(self, raw_listing: dict, source_id: str):
         try:
             current_price = Decimal(str(price_raw))
         except InvalidOperation:
-            current_price = Decimal("0.00")
+            current_price = None
 
         listing = db.query(ProductListing).filter(
             ProductListing.source_id == source_id,
@@ -281,6 +297,7 @@ def normalize_and_persist_task(self, raw_listing: dict, source_id: str):
         listing_url = raw_listing.get("url", "") or ""
         image_url = raw_listing.get("image_url", "") or None
         stock = raw_listing.get("stock")
+        is_available = raw_listing.get("available", True) if current_price is not None else False
 
         if not listing:
             listing = ProductListing(
@@ -293,7 +310,7 @@ def normalize_and_persist_task(self, raw_listing: dict, source_id: str):
                 current_hash=current_hash,
                 current_price=current_price,
                 current_stock=stock,
-                is_available=raw_listing.get("available", True),
+                is_available=is_available,
             )
             db.add(listing)
         else:
@@ -301,7 +318,7 @@ def normalize_and_persist_task(self, raw_listing: dict, source_id: str):
             listing.current_hash = current_hash
             listing.current_price = current_price
             listing.current_stock = stock
-            listing.is_available = raw_listing.get("available", True)
+            listing.is_available = is_available
             listing.last_seen_at = datetime.now(timezone.utc)
             if listing_url:
                 listing.url = listing_url
@@ -312,19 +329,21 @@ def normalize_and_persist_task(self, raw_listing: dict, source_id: str):
         db.refresh(listing)
 
         # ── Step 4: Append Price History ─────────────────────────────────
-        history = PriceHistory(
-            listing_id=listing.id,
-            price=current_price,
-            stock=stock,
-        )
-        db.add(history)
-        db.commit()
+        if current_price is not None:
+            history = PriceHistory(
+                listing_id=listing.id,
+                price=current_price,
+                stock=stock,
+            )
+            db.add(history)
+            db.commit()
 
         log.info(f"Persisted: [{brand}] {product_name} {ml}ml ({fragrance_type}) @ {current_price}")
 
     except IntegrityError as e:
         db.rollback()
-        log.warning(f"Integrity error (likely duplicate) for '{raw_title}': {e}")
+        log.warning(f"Integrity error (likely duplicate) for '{raw_title}', retrying: {e}")
+        raise self.retry(exc=e)
     except Exception as exc:
         db.rollback()
         log.error(f"normalize_and_persist_task failed for '{raw_title}': {exc}", exc_info=True)

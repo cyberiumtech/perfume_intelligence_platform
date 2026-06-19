@@ -1,14 +1,23 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
 
-# Virtual environments
-.venv
-
-# Secrets and local configurations
+# Environment files
 .env
-.env.*
+
+# SSH keys, local credentials & local model data
+ollama_data/
+
+# Local outputs, scrap files & logs
+*.log
+*.csv
+*.json
+*.html
+!pyproject.toml
