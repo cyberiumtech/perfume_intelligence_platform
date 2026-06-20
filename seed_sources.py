@@ -1,154 +1,106 @@
-"""
-Source seeding script - registers all Chilean perfume distributor sources.
-
-Run once after fresh DB creation:
-    python seed_sources.py
-
-Sources:
-1. eliteperfumes-distribuidor.cl  → Shopify (public API, no credentials needed)
-2. lacasadelperfume.cl            → WooCommerce/WordPress BS4 scraper
-3. multimarcasmayorista.cl        → Jumpseller BS4 scraper
-4. pdlbodega.cl                   → ASP.NET B2B (Playwright, needs credentials)
-5. cosmetic-distribucion.cl       → ASP.NET B2B (Playwright, needs credentials)
-"""
 import os
 import sys
-
-sys.path.insert(0, os.path.dirname(__file__))
-
+import uuid
+import sqlalchemy
 from dotenv import load_dotenv
-load_dotenv()
 
-from app.database import SessionLocal, engine
-from app.models import Base, Source
-
-# Ensure tables exist
-Base.metadata.create_all(bind=engine)
+load_dotenv('.env')
+DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:root@localhost:5432/perfume_intelligence_db')
+engine = sqlalchemy.create_engine(DATABASE_URL)
 
 SOURCES = [
-    # ── Source 1: Elite Perfumes Distribuidor (Shopify) ─────────────────────
     {
-        "name": "Elite Perfumes Distribuidor",
-        "base_url": "https://www.eliteperfumes-distribuidor.cl",
+        "name": "Elite Perfumes",
+        "base_url": "https://www.eliteperfumes-distribuidor.cl/",
         "engine_type": "shopify",
-        "config": {
-            "catalog_path": "/collections/perfumes/products.json"
-        },
-        "is_active": True,
+        "config": {}
     },
-
-    # ── Source 2: La Casa del Perfume (WooCommerce) ──────────────────────────
     {
         "name": "La Casa del Perfume",
-        "base_url": "https://lacasadelperfume.cl",
-        "engine_type": "bs4_woocommerce",
-        "config": {
-            "catalog_path": "/tienda/",
-            "max_pages": 50,
-        },
-        "is_active": True,
+        "base_url": "https://www.lacasadelperfume.com/",
+        "engine_type": "shopify",
+        "config": {}
     },
-
-    # ── Source 3: Multimarcas Mayorista (Jumpseller) ─────────────────────────
+    {
+        "name": "Comprar en Chile",
+        "base_url": "https://comprarenchile.cl/",
+        "engine_type": "shopify",
+        "config": {}
+    },
     {
         "name": "Multimarcas Mayorista",
-        "base_url": "https://www.multimarcasmayorista.cl",
+        "base_url": "https://www.multimarcasmayorista.cl/",
         "engine_type": "bs4_jumpseller",
-        "config": {
-            "catalog_path": "/perfumes",
-            "max_pages": 100,
-        },
-        "is_active": True,
+        "config": {}
     },
-
-    # ── Source 4: PDL Bodega / Productos de Lujo VIP (ASP.NET B2B) ──────────
-    # Requires B2B login credentials. Set is_active=False until credentials added.
     {
-        "name": "PDL Bodega (Productos de Lujo VIP)",
-        "base_url": "https://pdlbodega.cl",
+        "name": "VYP Mayorista",
+        "base_url": "https://vypmayorista.cl/",
+        "engine_type": "bs4_woocommerce",
+        "config": {}
+    },
+    {
+        "name": "PDL Bodega",
+        "base_url": "https://www.pdlbodega.cl/",
         "engine_type": "playwright",
         "config": {
-            "login_url": "/wholesale/",
-            "email_selector": "#MainContent_txtEmail",
-            "password_selector": "#MainContent_txtPassword",
-            "submit_selector": "#MainContent_cmdLogin",
-            "catalog_url": "/CreateOrder",
-            "product_selector": "tr.product-row, .product-item, tr[data-product]",
-            "next_page_selector": "a.next, .pagination .next, li.next a",
-            "max_pages": 100,
-            # Set credentials here or in .env as B2B_PDL_EMAIL / B2B_PDL_PASSWORD
-            "username": os.getenv("B2B_PDL_EMAIL", ""),
-            "password": os.getenv("B2B_PDL_PASSWORD", ""),
-        },
-        # Set to True once you have valid B2B credentials for this portal
-        "is_active": False,
+            "username": "kameshgurkha1991.kg@gmail.com",
+            "password": "123456",
+            "login_url": "/wholesale"
+        }
     },
-
-    # ── Source 5: Cosmetic Distribucion (ASP.NET B2B) ────────────────────────
-    # Requires B2B login credentials. Set is_active=False until credentials added.
     {
         "name": "Cosmetic Distribucion",
-        "base_url": "https://cosmetic-distribucion.cl",
+        "base_url": "https://www.cosmetic-distribucion.cl/",
         "engine_type": "playwright",
         "config": {
-            "login_url": "/WholeSale/Login",
-            "email_selector": "#MainContent_txtEmail",
-            "password_selector": "#MainContent_txtPassword",
-            "submit_selector": "#MainContent_cmdLogin",
-            "catalog_url": "/WholeSale/Catalog",
-            "product_selector": ".product-item, tr.product-row, .catalog-item",
-            "next_page_selector": "a.next, .pagination .next",
-            "max_pages": 100,
-            # Set credentials here or in .env as B2B_COSMETIC_EMAIL / B2B_COSMETIC_PASSWORD
-            "username": os.getenv("B2B_COSMETIC_EMAIL", ""),
-            "password": os.getenv("B2B_COSMETIC_PASSWORD", ""),
-        },
-        # Set to True once you have valid B2B credentials for this portal
-        "is_active": False,
-    },
+            "username": "kameshgurkha1991.kg@gmail.com",
+            "password": "Kunal1986@@",
+            "login_url": "/wholesale/Login.aspx"
+        }
+    }
 ]
 
+import json
 
 def seed():
-    db = SessionLocal()
-    created, skipped, updated = 0, 0, 0
-
-    try:
-        for source_data in SOURCES:
-            is_active = source_data.pop("is_active")
-            existing = db.query(Source).filter(Source.name == source_data["name"]).first()
-
-            if existing:
-                # Update config and active status
-                for k, v in source_data.items():
-                    setattr(existing, k, v)
-                existing.is_active = is_active
-                print(f"  [U] Updated:  {existing.name}")
-                updated += 1
+    with engine.begin() as conn:
+        for s in SOURCES:
+            # Check if source exists
+            res = conn.execute(sqlalchemy.text("SELECT id FROM sources WHERE name = :name"), {"name": s["name"]}).fetchone()
+            if res:
+                # Update existing
+                print(f"Updating {s['name']}...")
+                conn.execute(
+                    sqlalchemy.text("""
+                        UPDATE sources 
+                        SET base_url = :base_url, engine_type = :engine_type, config = CAST(:config AS JSONB), is_active = true
+                        WHERE name = :name
+                    """),
+                    {
+                        "name": s["name"],
+                        "base_url": s["base_url"],
+                        "engine_type": s["engine_type"],
+                        "config": json.dumps(s["config"])
+                    }
+                )
             else:
-                source = Source(**source_data, is_active=is_active)
-                db.add(source)
-                print(f"  [+] Created:  {source.name} ({source.engine_type})")
-                created += 1
-
-        db.commit()
-        print(f"\nSeeding complete - {created} created, {updated} updated, {skipped} skipped")
-        print("\nActive sources:")
-        for s in db.query(Source).filter(Source.is_active == True).all():
-            print(f"  [ON]  {s.name} [{s.engine_type}] - {s.base_url}")
-        print("\nInactive sources (need B2B credentials):")
-        for s in db.query(Source).filter(Source.is_active == False).all():
-            print(f"  [OFF] {s.name} [{s.engine_type}] - add credentials to .env to activate")
-
-    except Exception as e:
-        db.rollback()
-        print(f"[ERROR] Seeding failed: {e}")
-        raise
-    finally:
-        db.close()
-
+                # Insert new
+                print(f"Inserting {s['name']}...")
+                conn.execute(
+                    sqlalchemy.text("""
+                        INSERT INTO sources (id, name, base_url, engine_type, config, is_active, currency, created_at)
+                        VALUES (:id, :name, :base_url, :engine_type, CAST(:config AS JSONB), true, 'CLP', NOW())
+                    """),
+                    {
+                        "id": str(uuid.uuid4()),
+                        "name": s["name"],
+                        "base_url": s["base_url"],
+                        "engine_type": s["engine_type"],
+                        "config": json.dumps(s["config"])
+                    }
+                )
+    print("Seed complete.")
 
 if __name__ == "__main__":
-    print("Seeding Chilean perfume distributor sources...")
-    print("")
     seed()

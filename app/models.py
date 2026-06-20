@@ -1,70 +1,197 @@
+"""
+SQLAlchemy 2.0 ORM models for the Perfume Intelligence Platform.
+
+Maps directly to the PostgreSQL schema in schema.sql.
+All enum types use native PostgreSQL enums.
+No Base.metadata.create_all() — use Alembic migrations only.
+"""
+import enum
+import logging
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, Numeric, DateTime, ForeignKey, Text, Boolean
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import (
+    Column, String, Integer, Numeric, DateTime, ForeignKey, Text, Boolean,
+    Index, UniqueConstraint, CheckConstraint, Enum, event,
+)
 from sqlalchemy.dialects.postgresql import UUID, JSONB, TSVECTOR
-from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy import Index, UniqueConstraint
+from sqlalchemy.orm import declarative_base, relationship, Session
+
+from .exceptions import InvalidStateTransitionError, ProductCodeError
+from .product_code_generator import get_next_code_from_db, generate_emergency_code
+
+log = logging.getLogger(__name__)
 
 Base = declarative_base()
 
 
-class Product(Base):
-    """
-    Canonical master record for a unique perfume product.
-    One Product = one distinct (brand, product_name, variant, ml) combination.
-    Multiple sources can link to the same Product via ProductListing.
-    """
-    __tablename__ = "products"
+# ══════════════════════════════════════════════════════════════════════════════
+# ENUMS (mirror PostgreSQL CREATE TYPE)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    ean_13 = Column(String(14), unique=True, index=True, nullable=True)  # EAN-13 or UPC barcode
-    brand = Column(String, nullable=False, index=True)
-    product_name = Column(String, nullable=False)
-    variant = Column(String, nullable=True)                  # e.g., "Intense", "Sport"
-    fragrance_type = Column(String, nullable=True)           # EDP / EDT / PARFUM / COLOGNE / BODY_MIST
-    ml = Column(Integer, nullable=True, index=True)          # Volume in milliliters
-    gender = Column(String(6), nullable=True)                # M / F / UNISEX
-    search_vector = Column(TSVECTOR, nullable=True)          # GIN-indexed for full-text search
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc)
-    )
+class AvailabilityState(str, enum.Enum):
+    AVAILABLE_IN_STOCK = "AVAILABLE_IN_STOCK"
+    AVAILABLE_NO_STOCK = "AVAILABLE_NO_STOCK"
+    DELISTED = "DELISTED"
 
-    listings = relationship("ProductListing", back_populates="product", cascade="all, delete-orphan")
 
-    __table_args__ = (
-        UniqueConstraint("brand", "product_name", "variant", "ml", name="uq_product_identity", postgresql_nulls_not_distinct=True),
-        Index("ix_products_search_vector", "search_vector", postgresql_using="gin"),
-        Index("ix_products_brand_name", "brand", "product_name"),
-    )
+class EngineType(str, enum.Enum):
+    SHOPIFY = "shopify"
+    BS4_WOOCOMMERCE = "bs4_woocommerce"
+    BS4_JUMPSELLER = "bs4_jumpseller"
+    PLAYWRIGHT = "playwright"
 
-    def __repr__(self):
-        return f"<Product {self.brand} – {self.product_name} {self.ml}ml>"
 
+class ScrapeStatus(str, enum.Enum):
+    STARTED = "STARTED"
+    SUCCESS = "SUCCESS"
+    PARTIAL = "PARTIAL"
+    FAIL = "FAIL"
+
+
+class NormalizationMethod(str, enum.Enum):
+    REGEX = "REGEX"
+    LLM_BEDROCK = "LLM_BEDROCK"
+    LLM_OLLAMA = "LLM_OLLAMA"
+    HYBRID = "HYBRID"
+    MANUAL = "MANUAL"
+
+
+class GenderType(str, enum.Enum):
+    M = "M"
+    F = "F"
+    UNISEX = "UNISEX"
+
+
+class FragranceType(str, enum.Enum):
+    EDP = "EDP"
+    EDT = "EDT"
+    PARFUM = "PARFUM"
+    COLOGNE = "COLOGNE"
+    BODY_MIST = "BODY_MIST"
+
+
+# Valid availability state transitions
+_AVAILABILITY_TRANSITIONS = {
+    AvailabilityState.AVAILABLE_IN_STOCK: {
+        AvailabilityState.AVAILABLE_NO_STOCK,
+        AvailabilityState.DELISTED,
+    },
+    AvailabilityState.AVAILABLE_NO_STOCK: {
+        AvailabilityState.AVAILABLE_IN_STOCK,
+        AvailabilityState.DELISTED,
+    },
+    AvailabilityState.DELISTED: set(),  # Terminal — no transitions allowed
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELS
+# ══════════════════════════════════════════════════════════════════════════════
 
 class Source(Base):
     """
     A scraping source — one row per Chilean distributor website.
     engine_type drives which scraper strategy is used.
-    config stores site-specific options (login creds, selectors, etc.).
+    config stores site-specific options (selectors, pagination, etc.).
     """
     __tablename__ = "sources"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(String, unique=True, nullable=False)
-    base_url = Column(String, nullable=False)
-    engine_type = Column(String, nullable=False)  # shopify | bs4_woocommerce | bs4_jumpseller | playwright
-    config = Column(JSONB, default=dict, nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    name = Column(String(255), unique=True, nullable=False)
+    base_url = Column(String(512), nullable=False)
+    engine_type = Column(
+        Enum(EngineType, name="engine_type", create_type=False, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+    )
+    config = Column(JSONB, nullable=False, default=dict)
+    is_active = Column(Boolean, nullable=False, default=True)
+    currency = Column(String(3), nullable=False, default="CLP")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
-    listings = relationship("ProductListing", back_populates="source")
-    scrape_logs = relationship("ScrapeLog", back_populates="source")
+    # Relationships
+    listings = relationship("ProductListing", back_populates="source", cascade="all, delete-orphan")
+    scrape_logs = relationship("ScrapeLog", back_populates="source", cascade="all, delete-orphan")
+    scrape_queue_entries = relationship("ScrapeQueue", back_populates="source", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Source {self.name} ({self.engine_type})>"
+
+
+class Product(Base):
+    """
+    Canonical master record for a unique perfume product.
+    One Product = one distinct (brand, product_name, variant, volume_ml) combination.
+    Multiple sources can link to the same Product via ProductListing.
+    """
+    __tablename__ = "products"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    product_code = Column(String(16), unique=True, nullable=False)
+    ean_13 = Column(String(13), nullable=True)
+    brand = Column(String(255), nullable=False)
+    product_name = Column(String(255), nullable=False)
+    variant = Column(String(255), nullable=True)
+    fragrance_type = Column(
+        Enum(FragranceType, name="fragrance_type", create_type=False, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=True,
+    )
+    volume_ml = Column(Integer, nullable=True)
+    gender = Column(
+        Enum(GenderType, name="gender_type", create_type=False, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=True,
+    )
+    search_vector = Column(TSVECTOR, nullable=True)
+    normalization_method = Column(
+        Enum(NormalizationMethod, name="normalization_method", create_type=False, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=True,
+    )
+    confidence_score = Column(Numeric(3, 2), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    # Relationships
+    listings = relationship("ProductListing", back_populates="product", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "brand", "product_name", "variant", "volume_ml",
+            name="uq_product_identity",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_products_search_vector", "search_vector", postgresql_using="gin"),
+        Index("ix_products_brand_name", "brand", "product_name"),
+    )
+
+    @classmethod
+    def create_with_code(cls, db: Session, **kwargs) -> "Product":
+        """
+        Create a new Product with an auto-generated product_code.
+
+        Uses SELECT FOR UPDATE SKIP LOCKED for thread safety.
+        Falls back to emergency code generation on failure.
+
+        Args:
+            db: SQLAlchemy session (must be in a transaction)
+            **kwargs: Product fields (brand, product_name, etc.)
+
+        Returns:
+            New Product instance (added to session but not committed)
+        """
+        try:
+            code = get_next_code_from_db(db)
+        except Exception as e:
+            log.warning(f"Sequential code generation failed, using emergency code: {e}")
+            code = generate_emergency_code()
+
+        product = cls(product_code=code, **kwargs)
+        db.add(product)
+        return product
+
+    def __repr__(self):
+        return f"<Product {self.product_code}: {self.brand} – {self.product_name} {self.volume_ml}ml>"
 
 
 class ProductListing(Base):
@@ -78,37 +205,82 @@ class ProductListing(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     product_id = Column(UUID(as_uuid=True), ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     source_id = Column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"), nullable=False)
-    source_external_id = Column(String, nullable=False)     # SKU or stable ID at source
-    title = Column(String, nullable=False)                   # Raw title as scraped
-    url = Column(String, nullable=True)                      # Product page URL at source
-    image_url = Column(String, nullable=True)                # Primary product image URL
-    current_hash = Column(String(64), index=True, nullable=True)  # SHA-256 of (price+title+stock)
-    current_price = Column(Numeric(12, 2), nullable=True)   # Price in CLP
-    current_stock = Column(Integer, nullable=True)           # Stock count
-    is_available = Column(Boolean, default=True, nullable=False)
-    last_seen_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc)
+    source_external_id = Column(String(255), nullable=False)
+
+    title = Column(String(500), nullable=False)
+    url = Column(String(1024), nullable=True)
+    image_url = Column(String(1024), nullable=True)
+
+    current_hash = Column(String(64), nullable=False)
+    current_price = Column(Numeric(12, 2), nullable=True)
+    current_stock = Column(Integer, nullable=True)
+    availability = Column(
+        Enum(AvailabilityState, name="availability_state", create_type=False, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+        default=AvailabilityState.AVAILABLE_IN_STOCK,
     )
 
+    last_seen_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    last_scraped_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    # Relationships
     product = relationship("Product", back_populates="listings")
     source = relationship("Source", back_populates="listings")
     price_history = relationship("PriceHistory", back_populates="listing", cascade="all, delete-orphan")
+    price_tiers = relationship("PriceTier", back_populates="listing", cascade="all, delete-orphan")
 
     __table_args__ = (
         UniqueConstraint("source_id", "source_external_id", name="uq_listing_source_external_id"),
-        Index("ix_listing_source_id", "source_id"),
+        Index("ix_listing_product_source_price", "product_id", "source_id", "current_price"),
+        Index("ix_listing_source_external", "source_id", "source_external_id"),
+        Index("ix_listing_last_seen_source", "source_id", "last_seen_at"),
+        Index("ix_listing_availability", "availability"),
+        Index("ix_listing_product_availability", "product_id", "availability"),
     )
 
+    def transition_availability(self, new_state: AvailabilityState) -> None:
+        """
+        Validate and apply an availability state transition.
+
+        Valid transitions:
+            AVAILABLE_IN_STOCK → AVAILABLE_NO_STOCK | DELISTED
+            AVAILABLE_NO_STOCK → AVAILABLE_IN_STOCK | DELISTED
+            DELISTED → (none — terminal state)
+
+        Args:
+            new_state: The target availability state
+
+        Raises:
+            InvalidStateTransitionError: If the transition is not allowed
+        """
+        current = self.availability
+        if isinstance(current, str):
+            current = AvailabilityState(current)
+        if isinstance(new_state, str):
+            new_state = AvailabilityState(new_state)
+
+        if current == new_state:
+            return  # No-op: same state
+
+        allowed = _AVAILABILITY_TRANSITIONS.get(current, set())
+        if new_state not in allowed:
+            raise InvalidStateTransitionError(
+                f"Cannot transition from {current.value} to {new_state.value}",
+                from_state=current.value,
+                to_state=new_state.value,
+            )
+
+        self.availability = new_state
+
     def __repr__(self):
-        return f"<Listing [{self.source_id}] {self.title} @ {self.current_price}>"
+        return f"<Listing [{self.source_id}] {self.title[:50]} @ {self.current_price}>"
 
 
 class PriceHistory(Base):
     """
     Append-only time-series of price and stock for a ProductListing.
-    One record inserted every time a price/stock change is detected.
+    One record inserted every time a price/stock/availability change is detected.
     """
     __tablename__ = "price_history"
 
@@ -116,16 +288,48 @@ class PriceHistory(Base):
     listing_id = Column(UUID(as_uuid=True), ForeignKey("product_listings.id", ondelete="CASCADE"), nullable=False)
     price = Column(Numeric(12, 2), nullable=False)
     stock = Column(Integer, nullable=True)
-    recorded_at = Column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        index=True
+    availability = Column(
+        Enum(AvailabilityState, name="availability_state", create_type=False, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
     )
+    recorded_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
+    # Relationships
     listing = relationship("ProductListing", back_populates="price_history")
+
+    __table_args__ = (
+        Index("ix_price_history_listing_time", "listing_id", recorded_at.desc()),
+        Index("ix_price_history_recorded", recorded_at.desc()),
+    )
 
     def __repr__(self):
         return f"<PriceHistory listing={self.listing_id} price={self.price}>"
+
+
+class PriceTier(Base):
+    """
+    Wholesale/retail price tiers for a ProductListing.
+    Supports multiple concurrent tiers with validity windows.
+    """
+    __tablename__ = "price_tiers"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    listing_id = Column(UUID(as_uuid=True), ForeignKey("product_listings.id", ondelete="CASCADE"), nullable=False)
+    tier_name = Column(String(100), nullable=False)
+    price = Column(Numeric(12, 2), nullable=False)
+    currency = Column(String(3), nullable=False, default="CLP")
+    valid_from = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    valid_to = Column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    listing = relationship("ProductListing", back_populates="price_tiers")
+
+    __table_args__ = (
+        UniqueConstraint("listing_id", "tier_name", "valid_from", name="uq_listing_tier_active"),
+    )
+
+    def __repr__(self):
+        return f"<PriceTier {self.tier_name} @ {self.price} {self.currency}>"
 
 
 class ScrapeLog(Base):
@@ -136,16 +340,76 @@ class ScrapeLog(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     source_id = Column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"), nullable=False)
-    status = Column(String, nullable=False)                 # STARTED / SUCCESS / FAIL / PARTIAL
-    s3_raw_uri = Column(String, nullable=True)              # S3 path of raw JSON backup
-    records_extracted = Column(Integer, default=0)
-    records_updated = Column(Integer, default=0)
-    records_skipped = Column(Integer, default=0)
+    status = Column(
+        Enum(ScrapeStatus, name="scrape_status", create_type=False, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+    )
+    raw_storage_ref = Column(String(512), nullable=True)
+    raw_data = Column(JSONB, nullable=True)
+    records_extracted = Column(Integer, nullable=False, default=0)
+    records_updated = Column(Integer, nullable=False, default=0)
+    records_skipped = Column(Integer, nullable=False, default=0)
+    records_failed = Column(Integer, nullable=False, default=0)
     error_message = Column(Text, nullable=True)
-    started_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     ended_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Relationships
     source = relationship("Source", back_populates="scrape_logs")
+
+    __table_args__ = (
+        Index("ix_scrape_logs_source_time", "source_id", started_at.desc()),
+        Index("ix_scrape_logs_status", "status"),
+    )
 
     def __repr__(self):
         return f"<ScrapeLog source={self.source_id} status={self.status}>"
+
+
+class ScrapeQueue(Base):
+    """
+    PostgreSQL-based job queue (pg-boss pattern).
+    Replaces Celery + Redis for Phase 1.
+    """
+    __tablename__ = "scrape_queue"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id = Column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(20), nullable=False, default="PENDING")
+    priority = Column(Integer, nullable=False, default=5)
+    scheduled_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    max_retries = Column(Integer, nullable=False, default=3)
+    raw_data = Column(JSONB, nullable=True)
+
+    # Relationships
+    source = relationship("Source", back_populates="scrape_queue_entries")
+
+    __table_args__ = (
+        Index("ix_scrape_queue_scheduled", "status", "scheduled_at", priority.desc()),
+        Index("ix_scrape_queue_source", "source_id", "status"),
+    )
+
+    def __repr__(self):
+        return f"<ScrapeQueue source={self.source_id} status={self.status}>"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EVENT LISTENERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@event.listens_for(Product, "before_insert")
+def validate_product_code_before_insert(mapper, connection, target):
+    """Validate that product_code is set and matches the required format before insert."""
+    if not target.product_code:
+        raise ProductCodeError("product_code must be set before inserting a Product")
+
+    import re
+    if not re.match(r'^[a-z]+[0-9]{8}$', target.product_code):
+        raise ProductCodeError(
+            f"Invalid product_code format: '{target.product_code}'. "
+            f"Expected pattern: [a-z]+[0-9]{{8}}"
+        )
