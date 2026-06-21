@@ -12,7 +12,7 @@ print()
 r = client.get("/api/v1/health")
 print(f"1. GET /api/v1/health -> {r.status_code}: {r.json()}")
 assert r.status_code == 200
-assert r.json()["database"] == "connected"
+assert r.json()["database"] == "connected (async)"
 
 # 2. Sources (empty)
 r = client.get("/api/v1/sources")

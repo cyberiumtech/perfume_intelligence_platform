@@ -4,15 +4,15 @@ services:
   postgres:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: root
-      POSTGRES_DB: perfume_intelligence_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-perfume_intelligence_db}
     ports:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d perfume_intelligence_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-perfume_intelligence_db}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -21,10 +21,12 @@ services:
     build: .
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: postgresql://postgres:root@postgres:5432/perfume_intelligence_db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-perfume_intelligence_db}
       OLLAMA_HOST: http://ollama:11434
-      LOG_LEVEL: INFO
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       postgres:
         condition: service_healthy
@@ -32,10 +34,16 @@ services:
 
   scraper:
     build: .
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: postgresql://postgres:root@postgres:5432/perfume_intelligence_db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-perfume_intelligence_db}
       OLLAMA_HOST: http://ollama:11434
-      LOG_LEVEL: INFO
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SCRAPER_POLL_INTERVAL: ${SCRAPER_POLL_INTERVAL:-30}
+      SCRAPE_INTERVAL_HOURS: ${SCRAPE_INTERVAL_HOURS:-4}
+      SCRAPER_BATCH_SIZE: ${SCRAPER_BATCH_SIZE:-25}
+      DELIST_THRESHOLD_MINUTES: ${DELIST_THRESHOLD_MINUTES:-1440}
     depends_on:
       postgres:
         condition: service_healthy

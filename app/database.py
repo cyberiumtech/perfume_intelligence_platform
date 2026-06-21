@@ -14,10 +14,14 @@ load_dotenv()
 
 log = logging.getLogger(__name__)
 
-SQLALCHEMY_DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:root@localhost:5432/perfume_intelligence_db",
-)
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not SQLALCHEMY_DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL environment variable is not set. "
+        "Set it in your .env file or environment. Example: "
+        "DATABASE_URL=postgresql://user:password@localhost:5432/perfume_intelligence_db"
+    )
 
 if "localhost" in SQLALCHEMY_DATABASE_URL or "127.0.0.1" in SQLALCHEMY_DATABASE_URL:
     log.warning("Using localhost database URL — ensure this is intentional in production")

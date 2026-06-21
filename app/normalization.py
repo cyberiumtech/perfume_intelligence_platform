@@ -716,12 +716,33 @@ class HybridNormalizer:
         """
         Args:
             llm_provider: Which LLM to use when regex is insufficient.
-                          "gemini" (default) or "ollama"
+                          "gemini" (default), "ollama", or "bedrock"
         """
+        self.llm_provider = llm_provider
         self.regex = RegexNormalizer()
-        self.ollama = OllamaNormalizer()
-        self.gemini = GeminiNormalizer()
-        self.openai = OpenAIBedrockNormalizer()
+        # Lazy-initialized LLM normalizers — avoids import errors
+        # when optional dependencies aren't installed
+        self._ollama = None
+        self._gemini = None
+        self._openai = None
+
+    @property
+    def ollama(self) -> OllamaNormalizer:
+        if self._ollama is None:
+            self._ollama = OllamaNormalizer()
+        return self._ollama
+
+    @property
+    def gemini(self) -> GeminiNormalizer:
+        if self._gemini is None:
+            self._gemini = GeminiNormalizer()
+        return self._gemini
+
+    @property
+    def openai(self) -> OpenAIBedrockNormalizer:
+        if self._openai is None:
+            self._openai = OpenAIBedrockNormalizer()
+        return self._openai
 
     def normalize(self, raw_title: str, vendor: str = None, tags: List[str] = None,
                   barcode: str = None, description: str = "") -> NormalizedProduct:

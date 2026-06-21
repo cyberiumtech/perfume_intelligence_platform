@@ -10,6 +10,8 @@ Endpoints:
   POST /api/v1/trigger-scrape                  — Create scrape queue entry
   GET  /api/v1/scrape-logs                     — Recent scrape audit logs
   GET  /api/v1/price-comparison/{product_code} — Price comparison across sources
+
+Fully modernized to use asynchronous routing and `asyncpg` for optimal concurrency.
 """
 import logging
 import uuid
@@ -17,10 +19,11 @@ from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy import text, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from .database import get_db
+from .database_async import get_db_async
 from .exceptions import (
     PerfumePlatformError, ProductNotFoundError, SourceNotFoundError,
     ScraperError, NormalizationError, DatabaseError, BusinessLogicError,
@@ -86,11 +89,11 @@ async def platform_error_handler(request: Request, exc: PerfumePlatformError):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["System"])
-def health_check(db: Session = Depends(get_db)):
-    """Verify API and database connectivity."""
+async def health_check(db: AsyncSession = Depends(get_db_async)):
+    """Verify API and database connectivity asynchronously."""
     try:
-        db.execute(text("SELECT 1"))
-        return {"status": "healthy", "database": "connected"}
+        await db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected (async)"}
     except Exception as e:
         log.error(f"Health check failed: {e}")
         raise HTTPException(status_code=503, detail=f"Database error: {e}")
@@ -101,22 +104,25 @@ def health_check(db: Session = Depends(get_db)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/sources", response_model=List[SourceSchema], tags=["Sources"])
-def list_sources(db: Session = Depends(get_db)):
+async def list_sources(db: AsyncSession = Depends(get_db_async)):
     """Return all configured scraping sources."""
-    return db.query(Source).order_by(Source.name).all()
+    result = await db.execute(select(Source).order_by(Source.name))
+    return result.scalars().all()
 
 
 @app.post("/api/v1/sources", response_model=SourceSchema, status_code=201, tags=["Sources"])
-def create_source(payload: SourceCreate, db: Session = Depends(get_db)):
+async def create_source(payload: SourceCreate, db: AsyncSession = Depends(get_db_async)):
     """Register a new scraping source."""
-    existing = db.query(Source).filter(Source.name == payload.name).first()
+    result = await db.execute(select(Source).filter(Source.name == payload.name))
+    existing = result.scalars().first()
+    
     if existing:
         raise HTTPException(status_code=409, detail=f"Source '{payload.name}' already exists")
 
     source = Source(**payload.model_dump())
     db.add(source)
-    db.commit()
-    db.refresh(source)
+    await db.commit()
+    await db.refresh(source)
     return source
 
 
@@ -125,21 +131,20 @@ def create_source(payload: SourceCreate, db: Session = Depends(get_db)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/products", response_model=List[ProductSchema], tags=["Products"])
-def list_products(
+async def list_products(
     brand: Optional[str] = Query(default=None),
     fragrance_type: Optional[str] = Query(default=None),
     gender: Optional[str] = Query(default=None),
     volume_ml: Optional[int] = Query(default=None, alias="ml"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=500),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db_async),
 ):
     """Query normalized canonical products with optional filters."""
-    q = db.query(Product)
+    q = select(Product)
 
     if brand:
-        escaped = brand.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        q = q.filter(Product.brand.ilike(f"%{escaped}%", escape="\\"))
+        q = q.filter(Product.brand.ilike(f"%{brand}%"))
     if fragrance_type:
         q = q.filter(Product.fragrance_type == fragrance_type.upper())
     if gender:
@@ -147,13 +152,20 @@ def list_products(
     if volume_ml:
         q = q.filter(Product.volume_ml == volume_ml)
 
-    return q.order_by(Product.brand, Product.product_name).offset(skip).limit(limit).all()
+    q = q.order_by(Product.brand, Product.product_name).offset(skip).limit(limit)
+    result = await db.execute(q)
+    return result.scalars().all()
 
 
 @app.get("/api/v1/products/{product_code}", tags=["Products"])
-def get_product(product_code: str, db: Session = Depends(get_db)):
+async def get_product(product_code: str, db: AsyncSession = Depends(get_db_async)):
     """Get a specific product by product_code with all its source listings."""
-    product = db.query(Product).filter(Product.product_code == product_code).first()
+    # We MUST use selectinload here to eagerly load the relationship, otherwise
+    # the async driver will crash with a MissingGreenletError when iterating listings.
+    q = select(Product).options(selectinload(Product.listings)).filter(Product.product_code == product_code)
+    result = await db.execute(q)
+    product = result.scalars().first()
+    
     if not product:
         raise HTTPException(status_code=404, detail=f"Product not found: {product_code}")
 
@@ -195,9 +207,9 @@ def get_product(product_code: str, db: Session = Depends(get_db)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/v1/trigger-scrape", response_model=TriggerScrapeResponse, tags=["Scraping"])
-def trigger_scrape(
+async def trigger_scrape(
     payload: ScrapeQueueCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db_async),
 ):
     """
     Trigger a scrape by creating a ScrapeQueue entry.
@@ -210,7 +222,9 @@ def trigger_scrape(
         raise HTTPException(status_code=400, detail="Invalid source_id UUID format")
 
     # Check source exists
-    source = db.query(Source).filter(Source.id == source_uuid).first()
+    result = await db.execute(select(Source).filter(Source.id == source_uuid))
+    source = result.scalars().first()
+    
     if not source:
         raise HTTPException(status_code=404, detail=f"Source not found: {payload.source_id}")
 
@@ -223,8 +237,8 @@ def trigger_scrape(
         priority=payload.priority,
     )
     db.add(queue_entry)
-    db.commit()
-    db.refresh(queue_entry)
+    await db.commit()
+    await db.refresh(queue_entry)
 
     return {
         "message": "Scrape queued successfully",
@@ -234,14 +248,16 @@ def trigger_scrape(
 
 
 @app.post("/api/v1/trigger-scrape-all", tags=["Scraping"])
-def trigger_scrape_all(
-    db: Session = Depends(get_db),
+async def trigger_scrape_all(
+    db: AsyncSession = Depends(get_db_async),
 ):
     """
     Trigger a scrape for ALL active sources.
     This is used by the frontend 'Update All' button.
     """
-    sources = db.query(Source).filter(Source.is_active == True).all()
+    result = await db.execute(select(Source).filter(Source.is_active == True))
+    sources = result.scalars().all()
+    
     if not sources:
         raise HTTPException(status_code=404, detail="No active sources found to scrape.")
 
@@ -251,7 +267,7 @@ def trigger_scrape_all(
         db.add(entry)
         queue_entries.append(entry)
     
-    db.commit()
+    await db.commit()
 
     return {
         "message": f"Scrape queued successfully for {len(sources)} active sources.",
@@ -264,16 +280,19 @@ def trigger_scrape_all(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/scrape-logs", response_model=List[ScrapeLogSchema], tags=["Scraping"])
-def list_scrape_logs(
+async def list_scrape_logs(
     source_id: Optional[str] = Query(default=None),
     limit: int = Query(default=20, le=100),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db_async),
 ):
     """Return recent scrape audit logs, optionally filtered by source."""
-    q = db.query(ScrapeLog)
+    q = select(ScrapeLog)
     if source_id:
         q = q.filter(ScrapeLog.source_id == source_id)
-    return q.order_by(ScrapeLog.started_at.desc()).limit(limit).all()
+        
+    q = q.order_by(ScrapeLog.started_at.desc()).limit(limit)
+    result = await db.execute(q)
+    return result.scalars().all()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -281,17 +300,18 @@ def list_scrape_logs(
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/price-comparison/{product_code}", tags=["Products"])
-def get_price_comparison(product_code: str, db: Session = Depends(get_db)):
+async def get_price_comparison(product_code: str, db: AsyncSession = Depends(get_db_async)):
     """
     Get price comparison across all sources for a product.
     Calls the get_price_comparison SQL function.
     """
-    result = db.execute(
+    result = await db.execute(
         text("SELECT * FROM get_price_comparison(:code)"),
         {"code": product_code},
-    ).fetchone()
+    )
+    row = result.first()
 
-    if not result:
+    if not row:
         raise HTTPException(
             status_code=404,
             detail=f"No price comparison data for product: {product_code}",
@@ -311,7 +331,7 @@ def get_price_comparison(product_code: str, db: Session = Depends(get_db)):
 
     response = {}
     for i, col in enumerate(columns):
-        val = result[i] if i < len(result) else None
+        val = row[i] if i < len(row) else None
         response[col] = float(val) if val is not None and col.startswith(("precio", "dif_")) else val
 
     return response

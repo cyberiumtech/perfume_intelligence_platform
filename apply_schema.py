@@ -1,7 +1,14 @@
 """Drop all existing objects and re-apply schema cleanly."""
 import psycopg2
+import os
+from dotenv import load_dotenv
 
-conn = psycopg2.connect("postgresql://postgres:root@localhost:5432/perfume_intelligence_db")
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL must be set in .env")
+
+conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
 cur = conn.cursor()
 

@@ -3,6 +3,8 @@ PostgreSQL-based scrape queue worker.
 
 Replaces Celery + Redis with a simple polling loop against the scrape_queue table.
 Processes one job at a time with retry logic.
+Includes auto-scheduling to replace Celery Beat — periodically queues scrapes
+for active sources that haven't been scraped recently.
 
 Usage:
     python -m app.scraper_worker
@@ -11,12 +13,13 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
-from sqlalchemy import text
+from sqlalchemy import text, func
 
 from .database import SessionLocal
 from .delta_engine import DeltaEngine, transition_delisted
@@ -36,6 +39,18 @@ log = logging.getLogger(__name__)
 POLL_INTERVAL = int(os.getenv("SCRAPER_POLL_INTERVAL", "30"))  # seconds
 BATCH_SIZE = int(os.getenv("SCRAPER_BATCH_SIZE", "25"))
 DELIST_THRESHOLD_MINUTES = int(os.getenv("DELIST_THRESHOLD_MINUTES", "1440"))  # 24h
+SCRAPE_INTERVAL_HOURS = int(os.getenv("SCRAPE_INTERVAL_HOURS", "4"))  # auto-schedule interval
+
+# Graceful shutdown flag
+_shutdown_requested = False
+
+
+def _handle_signal(signum, frame):
+    """Signal handler for graceful shutdown."""
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    log.info(f"Received {sig_name} — shutting down after current job completes...")
+    _shutdown_requested = True
 
 
 def claim_next_job(db) -> ScrapeQueue | None:
@@ -213,13 +228,85 @@ def _fail_job(db, job: ScrapeQueue, error_msg: str) -> None:
     db.commit()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-SCHEDULING (replaces Celery Beat)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _auto_schedule_sources(db) -> int:
+    """
+    Queue scrapes for active sources that haven't been scraped recently.
+
+    Checks each active source's last successful scrape log. If older than
+    SCRAPE_INTERVAL_HOURS, inserts a PENDING entry in scrape_queue.
+
+    Returns the number of sources queued.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=SCRAPE_INTERVAL_HOURS)
+    sources = db.query(Source).filter(Source.is_active == True).all()
+    queued = 0
+
+    for source in sources:
+        # Skip if already pending in queue
+        existing_pending = db.query(ScrapeQueue).filter(
+            ScrapeQueue.source_id == source.id,
+            ScrapeQueue.status.in_(["PENDING", "RUNNING"]),
+        ).first()
+        if existing_pending:
+            continue
+
+        # Check last successful scrape
+        last_scrape = db.query(ScrapeLog).filter(
+            ScrapeLog.source_id == source.id,
+            ScrapeLog.status.in_([ScrapeStatus.SUCCESS, ScrapeStatus.PARTIAL]),
+        ).order_by(ScrapeLog.started_at.desc()).first()
+
+        if last_scrape and last_scrape.started_at and last_scrape.started_at > cutoff:
+            continue  # Scraped recently — skip
+
+        # Queue a new scrape
+        entry = ScrapeQueue(source_id=source.id, priority=5)
+        db.add(entry)
+        queued += 1
+        log.info(f"Auto-scheduled scrape for: {source.name}")
+
+    if queued > 0:
+        db.commit()
+
+    return queued
+
+
 def run_worker():
     """Main worker loop — polls scrape_queue for pending jobs."""
-    log.info(f"Scraper worker started (poll interval: {POLL_INTERVAL}s)")
+    global _shutdown_requested
 
-    while True:
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    log.info(
+        f"Scraper worker started "
+        f"(poll_interval={POLL_INTERVAL}s, "
+        f"auto_schedule_interval={SCRAPE_INTERVAL_HOURS}h, "
+        f"batch_size={BATCH_SIZE})"
+    )
+
+    last_schedule_check = 0.0
+    schedule_check_interval = 300  # Check auto-schedule every 5 minutes
+
+    while not _shutdown_requested:
         db = SessionLocal()
         try:
+            # Periodically auto-schedule sources (replaces Celery Beat)
+            now = time.time()
+            if now - last_schedule_check > schedule_check_interval:
+                try:
+                    queued = _auto_schedule_sources(db)
+                    if queued > 0:
+                        log.info(f"Auto-scheduled {queued} source(s) for scraping")
+                except Exception as e:
+                    log.error(f"Auto-scheduling failed: {e}", exc_info=True)
+                last_schedule_check = now
+
             job = claim_next_job(db)
             if job:
                 log.info(f"Claimed job {job.id} for source {job.source_id}")
@@ -227,15 +314,20 @@ def run_worker():
                 process_job(job)
             else:
                 db.close()
-                time.sleep(POLL_INTERVAL)
-        except KeyboardInterrupt:
-            log.info("Worker shutting down...")
-            db.close()
-            break
+                # Sleep in small increments to check shutdown flag
+                for _ in range(POLL_INTERVAL):
+                    if _shutdown_requested:
+                        break
+                    time.sleep(1)
         except Exception as e:
             log.error(f"Worker loop error: {e}", exc_info=True)
-            db.close()
+            try:
+                db.close()
+            except Exception:
+                pass
             time.sleep(POLL_INTERVAL)
+
+    log.info("Worker shut down gracefully.")
 
 
 if __name__ == "__main__":
