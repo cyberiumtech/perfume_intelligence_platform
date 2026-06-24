@@ -30,7 +30,7 @@ from .exceptions import (
     ConfigurationError,
 )
 from .models import (
-    Source, Product, ProductListing, ScrapeLog, ScrapeQueue,
+    Source, Product, ProductListing, ScrapeLog, ScrapeQueue, PriceHistory,
     AvailabilityState,
 )
 from .schemas import (
@@ -136,11 +136,17 @@ async def list_products(
     fragrance_type: Optional[str] = Query(default=None),
     gender: Optional[str] = Query(default=None),
     volume_ml: Optional[int] = Query(default=None, alias="ml"),
+    in_stock: Optional[bool] = Query(default=None, description="Filter to only products with at least one listing AVAILABLE_IN_STOCK"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=500),
     db: AsyncSession = Depends(get_db_async),
 ):
-    """Query normalized canonical products with optional filters."""
+    """
+    Query normalized canonical products with optional filters.
+
+    Use in_stock=true to filter to products that have at least ONE listing
+    with availability == "AVAILABLE_IN_STOCK".
+    """
     q = select(Product)
 
     if brand:
@@ -151,6 +157,13 @@ async def list_products(
         q = q.filter(Product.gender == gender.upper())
     if volume_ml:
         q = q.filter(Product.volume_ml == volume_ml)
+
+    # Filter by stock availability
+    if in_stock is True:
+        # Only include products that have at least one listing with AVAILABLE_IN_STOCK
+        q = q.join(ProductListing).filter(
+            ProductListing.availability == AvailabilityState.AVAILABLE_IN_STOCK
+        ).distinct()
 
     q = q.order_by(Product.brand, Product.product_name).offset(skip).limit(limit)
     result = await db.execute(q)
@@ -165,7 +178,7 @@ async def get_product(product_code: str, db: AsyncSession = Depends(get_db_async
     q = select(Product).options(selectinload(Product.listings)).filter(Product.product_code == product_code)
     result = await db.execute(q)
     product = result.scalars().first()
-    
+
     if not product:
         raise HTTPException(status_code=404, detail=f"Product not found: {product_code}")
 
@@ -199,6 +212,112 @@ async def get_product(product_code: str, db: AsyncSession = Depends(get_db_async
             }
             for l in product.listings
         ],
+    }
+
+
+@app.get("/api/v1/products/{product_id}/comparison", tags=["Products"])
+async def get_product_comparison(product_id: str, db: AsyncSession = Depends(get_db_async)):
+    """
+    Get price comparison across all active sources for a specific product.
+
+    The core feature: for any given canonical product, show all distributor
+    listings with price, stock, source reliability, and MOQ side-by-side.
+    """
+    # Find product by UUID or product_code
+    try:
+        prod_uuid = uuid.UUID(product_id)
+        q = select(Product).filter(Product.id == prod_uuid)
+    except ValueError:
+        # Treat as product_code
+        q = select(Product).filter(Product.product_code == product_id)
+
+    result = await db.execute(q)
+    product = result.scalars().first()
+
+    if not product:
+        raise HTTPException(status_code=404, detail=f"Product not found: {product_id}")
+
+    # Get all listings from active sources, ordered by availability then price
+    from sqlalchemy import case
+    listings_q = (
+        select(ProductListing, Source)
+        .join(Source, ProductListing.source_id == Source.id)
+        .filter(
+            ProductListing.product_id == product.id,
+            Source.is_active == True,
+        )
+        .order_by(
+            case(
+                (ProductListing.availability == AvailabilityState.AVAILABLE_IN_STOCK, 0),
+                else_=1
+            ),
+            ProductListing.current_price.asc(),
+        )
+    )
+    listings_result = await db.execute(listings_q)
+    listings_with_sources = listings_result.all()
+
+    # Build listing details
+    listings = []
+    prices_in_stock = []
+    all_prices = []
+
+    for listing, source in listings_with_sources:
+        listing_data = {
+            "source_id": str(source.id),
+            "source_name": source.name,
+            "source_reliability": source.reliability_score or 50,
+            "price": float(listing.current_price) if listing.current_price else None,
+            "currency": listing.currency,
+            "stock": listing.current_stock,
+            "stock_confidence": listing.stock_confidence.value if listing.stock_confidence else "UNKNOWN",
+            "moq": listing.moq,
+            "bulk_tiers": listing.bulk_pricing_tiers or [],
+            "availability": listing.availability.value if hasattr(listing.availability, 'value') else listing.availability,
+            "last_seen": listing.last_seen_at.isoformat() if listing.last_seen_at else None,
+            "last_confirmed_stock_at": listing.last_confirmed_stock_at.isoformat() if listing.last_confirmed_stock_at else None,
+        }
+        listings.append(listing_data)
+
+        if listing.current_price:
+            all_prices.append(float(listing.current_price))
+            if listing.availability == AvailabilityState.AVAILABLE_IN_STOCK:
+                prices_in_stock.append(float(listing.current_price))
+
+    # Calculate price statistics
+    best_price_in_stock = None
+    if prices_in_stock:
+        min_price_in_stock = min(prices_in_stock)
+        for l in listings:
+            if l["price"] == min_price_in_stock and l["availability"] == "AVAILABLE_IN_STOCK":
+                best_price_in_stock = {
+                    "source_id": l["source_id"],
+                    "source_name": l["source_name"],
+                    "price": l["price"],
+                }
+                break
+
+    price_range = None
+    if all_prices:
+        price_range = {
+            "min": min(all_prices),
+            "max": max(all_prices),
+            "avg": sum(all_prices) / len(all_prices),
+        }
+
+    return {
+        "product": {
+            "id": str(product.id),
+            "product_code": product.product_code,
+            "name": product.product_name,
+            "brand": product.brand,
+            "volume": product.volume_ml,
+            "concentration": product.fragrance_type.value if product.fragrance_type else None,
+            "ean": product.ean_13,
+        },
+        "listings": listings,
+        "best_price_in_stock": best_price_in_stock,
+        "price_range": price_range,
     }
 
 
@@ -293,6 +412,65 @@ async def list_scrape_logs(
     q = q.order_by(ScrapeLog.started_at.desc()).limit(limit)
     result = await db.execute(q)
     return result.scalars().all()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRICE HISTORY
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/listings/{listing_id}/history", tags=["Products"])
+async def get_listing_price_history(
+    listing_id: str,
+    limit: int = Query(default=100, le=1000, description="Number of historical records to return"),
+    db: AsyncSession = Depends(get_db_async),
+):
+    """
+    Get price history time-series for a specific product listing.
+
+    Returns historical price + availability data for charting.
+    """
+    try:
+        listing_uuid = uuid.UUID(listing_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid listing_id UUID format")
+
+    # Verify listing exists
+    listing_q = select(ProductListing).filter(ProductListing.id == listing_uuid)
+    listing_result = await db.execute(listing_q)
+    listing = listing_result.scalars().first()
+
+    if not listing:
+        raise HTTPException(status_code=404, detail=f"Listing not found: {listing_id}")
+
+    # Get price history ordered by most recent first
+    history_q = (
+        select(PriceHistory)
+        .filter(PriceHistory.listing_id == listing_uuid)
+        .order_by(PriceHistory.recorded_at.desc())
+        .limit(limit)
+    )
+    history_result = await db.execute(history_q)
+    history_records = history_result.scalars().all()
+
+    return {
+        "listing_id": str(listing.id),
+        "product_id": str(listing.product_id),
+        "source_id": str(listing.source_id),
+        "title": listing.title,
+        "current_price": float(listing.current_price) if listing.current_price else None,
+        "current_stock": listing.current_stock,
+        "current_availability": listing.availability.value if hasattr(listing.availability, 'value') else listing.availability,
+        "history": [
+            {
+                "recorded_at": h.recorded_at.isoformat() if h.recorded_at else None,
+                "price": float(h.price) if h.price else None,
+                "stock": h.stock,
+                "availability": h.availability.value if hasattr(h.availability, 'value') else h.availability,
+                "source_name": h.source_name,
+            }
+            for h in reversed(history_records)  # Return oldest to newest for charting
+        ],
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

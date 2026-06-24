@@ -90,6 +90,12 @@ class ShopifyScraper(BaseScraper):
                         if variant_title and variant_title.lower() != "default title":
                             full_title = f"{raw_title} - {variant_title}"
 
+                        # Extract MOQ and bulk pricing from metafields if available
+                        moq = None
+                        bulk_tiers = []
+                        # Note: Shopify doesn't expose MOQ via products.json
+                        # This would require the Admin API or custom metafields
+
                         extracted_items.append({
                             "raw_title": full_title,
                             "vendor": vendor,
@@ -101,7 +107,10 @@ class ShopifyScraper(BaseScraper):
                             "image_url": image_url,
                             "tags": tags,
                             "stock": stock,
+                            "inventory_quantity": stock,  # Explicit for stock confidence detection
                             "available": available,
+                            "moq": moq,
+                            "bulk_tiers": bulk_tiers,
                         })
 
                 page += 1

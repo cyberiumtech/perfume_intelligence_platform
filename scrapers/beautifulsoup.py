@@ -159,14 +159,29 @@ class WooCommerceBs4Scraper(BaseScraper):
             desc_el = item.select_one(".woocommerce-product-details__short-description, .short-description, .excerpt, .product-excerpt")
             description = _clean(desc_el.get_text()) if desc_el else ""
 
-            # Stock
+            # Stock — extract both numeric count and raw text for confidence detection
             stock = None
+            stock_text = ""
             stock_el = item.select_one(".stock, .quantity, .in-stock")
             if stock_el:
                 stock_text = _clean(stock_el.get_text())
-                digits = re.sub(r"[^\d]", "", stock_text)
-                if digits:
-                    stock = int(digits)
+                # Parse "X in stock" pattern
+                match = re.search(r'(\d+)\s+en\s+stock|\d+\s+in\s+stock', stock_text.lower())
+                if match:
+                    stock = int(match.group(1))
+                else:
+                    digits = re.sub(r"[^\d]", "", stock_text)
+                    if digits:
+                        stock = int(digits)
+                    elif "agotado" in stock_text.lower() or "out of stock" in stock_text.lower():
+                        stock = 0
+
+            # Available: only True if we have positive stock or explicit in-stock text
+            available = None
+            if stock is not None:
+                available = stock > 0
+            elif "en stock" in (stock_text or "").lower() or "in stock" in (stock_text or "").lower():
+                available = True
 
             return {
                 "raw_title": raw_title,
@@ -179,7 +194,10 @@ class WooCommerceBs4Scraper(BaseScraper):
                 "image_url": image_url,
                 "tags": tags,
                 "stock": stock,
-                "available": True,
+                "stock_text": stock_text,  # Raw text for confidence detection
+                "available": available,
+                "moq": None,
+                "bulk_tiers": [],
             }
         except Exception as e:
             print(f"[WooCommerceBs4] Error parsing product: {e}")
@@ -307,14 +325,29 @@ class JumpsellerBs4Scraper(BaseScraper):
             desc_el = item.select_one(".description, .short-description, .product-description, .caption")
             description = _clean(desc_el.get_text()) if desc_el else ""
 
-            # Stock
+            # Stock — extract both numeric count and raw text for confidence detection
             stock = None
+            stock_text = ""
             stock_el = item.select_one(".stock, .quantity, .inventory")
             if stock_el:
                 stock_text = _clean(stock_el.get_text())
-                digits = re.sub(r"[^\d]", "", stock_text)
-                if digits:
-                    stock = int(digits)
+                # Parse "X in stock" pattern
+                match = re.search(r'(\d+)\s+en\s+stock|\d+\s+in\s+stock', stock_text.lower())
+                if match:
+                    stock = int(match.group(1))
+                else:
+                    digits = re.sub(r"[^\d]", "", stock_text)
+                    if digits:
+                        stock = int(digits)
+                    elif "agotado" in stock_text.lower() or "out of stock" in stock_text.lower():
+                        stock = 0
+
+            # Available: only True if we have positive stock or explicit in-stock text
+            available = None
+            if stock is not None:
+                available = stock > 0
+            elif "en stock" in (stock_text or "").lower() or "in stock" in (stock_text or "").lower():
+                available = True
 
             return {
                 "raw_title": raw_title,
@@ -327,7 +360,10 @@ class JumpsellerBs4Scraper(BaseScraper):
                 "image_url": image_url,
                 "tags": tags,
                 "stock": stock,
-                "available": True,
+                "stock_text": stock_text,  # Raw text for confidence detection
+                "available": available,
+                "moq": None,
+                "bulk_tiers": [],
             }
         except Exception as e:
             print(f"[JumpsellerBs4] Error parsing product: {e}")

@@ -22,8 +22,8 @@ from dotenv import load_dotenv
 from sqlalchemy import text, func
 
 from .database import SessionLocal
-from .delta_engine import DeltaEngine, transition_delisted
-from .models import Source, ScrapeLog, ScrapeQueue, ScrapeStatus
+from .delta_engine import DeltaEngine, transition_delisted, extract_stock
+from .models import Source, ScrapeLog, ScrapeQueue, ScrapeStatus, ScrapingLog
 from .scrapers.factory import ScraperFactory
 
 load_dotenv()
@@ -129,6 +129,32 @@ def process_job(job: ScrapeQueue) -> None:
         total = len(raw_catalog)
         log.info(f"[{source.name}] Extracted {total} raw listings")
 
+        # ── Orchestrator Fix: Handle empty/failed scrapes properly ──
+        if raw_catalog is None:
+            log.error(f"[{source.name}] Scraper returned None — logging as FAILED_ERROR")
+            scrape_log.status = ScrapeStatus.FAILED_ERROR
+            scrape_log.error_message = "Scraper returned None"
+            scrape_log.ended_at = datetime.now(timezone.utc)
+            db.commit()
+            # Also log to scraping_logs table
+            _log_scrape(db, source.id, "FAILED_ERROR", 0, 0, "Scraper returned None")
+            _complete_job(db, job, "FAILED")
+            return
+
+        if total == 0:
+            log.warning(f"[{source.name}] Empty catalog — logging as EMPTY")
+            scrape_log.status = ScrapeStatus.EMPTY
+            scrape_log.error_message = "No products found"
+            scrape_log.ended_at = datetime.now(timezone.utc)
+            db.commit()
+            # Also log to scraping_logs table
+            _log_scrape(db, source.id, "EMPTY", 0, 0, "No products found")
+            _complete_job(db, job, "DONE")
+            return
+
+        # Count items with stock data
+        items_with_stock = sum(1 for r in raw_catalog if extract_stock(r, source.engine_type.value if hasattr(source.engine_type, 'value') else source.engine_type) is not None)
+
         # Store raw data in scrape_log (replaces S3)
         try:
             scrape_log.raw_data = raw_catalog
@@ -174,9 +200,17 @@ def process_job(job: ScrapeQueue) -> None:
         scrape_log.records_updated = total_updated
         scrape_log.records_skipped = total_skipped
         scrape_log.records_failed = total_failed
+        scrape_log.items_with_stock = items_with_stock
         scrape_log.status = ScrapeStatus.SUCCESS if total_failed == 0 else ScrapeStatus.PARTIAL
         scrape_log.ended_at = datetime.now(timezone.utc)
         db.commit()
+
+        # Also log to the new scraping_logs table
+        _log_scrape(
+            db, source.id,
+            "SUCCESS" if total_failed == 0 else "PARTIAL",
+            total, items_with_stock,
+        )
 
         # Complete job
         _complete_job(db, job, "DONE")
@@ -196,6 +230,12 @@ def process_job(job: ScrapeQueue) -> None:
             scrape_log.error_message = error_msg
             scrape_log.ended_at = datetime.now(timezone.utc)
             db.commit()
+
+        # Also log to scraping_logs table
+        try:
+            _log_scrape(db, job.source_id, "FAILED_ERROR", 0, 0, error_msg)
+        except Exception:
+            pass
 
         # Handle retries
         if job.retry_count < job.max_retries:
@@ -218,6 +258,27 @@ def _complete_job(db, job: ScrapeQueue, status: str) -> None:
     job.status = status
     job.ended_at = datetime.now(timezone.utc)
     db.commit()
+
+
+def _log_scrape(db, source_id, status, items_scraped, items_with_stock, error_msg=None):
+    """Log scrape result to the new scraping_logs table."""
+    try:
+        scrape_log_entry = ScrapingLog(
+            source_id=source_id,
+            status=status,
+            items_scraped=items_scraped,
+            items_with_stock=items_with_stock,
+            error_message=error_msg,
+            ended_at=datetime.now(timezone.utc),
+        )
+        db.add(scrape_log_entry)
+        db.commit()
+    except Exception as e:
+        log.warning(f"Failed to write scraping_logs entry: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _fail_job(db, job: ScrapeQueue, error_msg: str) -> None:
